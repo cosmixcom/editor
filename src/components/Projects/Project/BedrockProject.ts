@@ -5,49 +5,91 @@ import { createFromGeometry } from '/@/components/Editors/EntityModel/create/fro
 import { createFromClientEntity } from '/@/components/Editors/EntityModel/create/fromClientEntity'
 import { createFromEntity } from '/@/components/Editors/EntityModel/create/fromEntity'
 import { ParticlePreviewTab } from '/@/components/Editors/ParticlePreview/ParticlePreview'
-import { BlockModelTab } from '../../Editors/BlockModel/Tab'
-import { CommandData } from '../../Languages/Mcfunction/Data'
-import { WorldTab } from '../../BedrockWorlds/Render/Tab'
+import { BlockModelTab } from '/@/components/Editors/BlockModel/Tab'
+import { CommandData } from '/@/components/Languages/Mcfunction/Data'
+// import { WorldTab } from '/@/components/BedrockWorlds/Render/Tab'
+import { FileTab } from '../../TabSystem/FileTab'
+import { HTMLPreviewTab } from '../../Editors/HTMLPreview/HTMLPreview'
+import { LangData } from '/@/components/Languages/Lang/Data'
+import { ColorData } from '../../Languages/Json/ColorPicker/Data'
 
 const bedrockPreviews: ITabPreviewConfig[] = [
 	{
 		name: 'preview.viewModel',
-		fileMatch: 'RP/models/',
+		fileType: 'geometry',
 		createPreview: (tabSystem, tab) => createFromGeometry(tabSystem, tab),
 	},
 	{
 		name: 'preview.viewModel',
-		fileMatch: 'RP/entity/',
+		fileType: 'clientEntity',
 		createPreview: (tabSystem, tab) =>
 			createFromClientEntity(tabSystem, tab),
 	},
 	{
 		name: 'preview.viewEntity',
-		fileMatch: 'BP/entities/',
+		fileType: 'entity',
 		createPreview: (tabSystem, tab) => createFromEntity(tabSystem, tab),
 	},
 	{
 		name: 'preview.viewParticle',
-		fileMatch: 'RP/particles/',
+		fileType: 'particle',
 		createPreview: async (tabSystem, tab) =>
 			new ParticlePreviewTab(tab, tabSystem),
 	},
 	{
 		name: 'preview.viewBlock',
-		fileMatch: 'BP/blocks/',
-		createPreview: async (tabSystem, tab) =>
-			new BlockModelTab(tab.getProjectPath(), tab, tabSystem),
+		fileType: 'block',
+		createPreview: async (tabSystem, tab) => {
+			const previewTab = new BlockModelTab(tab.getPath(), tab, tabSystem)
+			previewTab.setPreviewOptions({ loadComponents: true })
+
+			return previewTab
+		},
 	},
+	/*{
+		name: 'preview.simulateLoot',
+		fileType: 'lootTable',
+		createPreview: async (tabSystem, tab) =>
+			new LootTableSimulatorTab(tab, tabSystem),
+	},*/
 ]
 
 export class BedrockProject extends Project {
 	commandData = new CommandData()
+	langData = new LangData()
+	colorData = new ColorData()
 
 	onCreate() {
 		bedrockPreviews.forEach((tabPreview) =>
 			this.tabActionProvider.registerPreview(tabPreview)
 		)
+
+		this.tabActionProvider.register({
+			name: 'preview.name',
+			icon: 'mdi-play',
+			isFor: (tab) => {
+				return (
+					tab instanceof FileTab &&
+					tab.getFileHandle().name.endsWith('.html')
+				)
+			},
+			trigger: (tab) => {
+				const inactiveTabSystem = this.app.project.inactiveTabSystem
+				if (!inactiveTabSystem) return
+
+				inactiveTabSystem.add(
+					new HTMLPreviewTab(inactiveTabSystem, {
+						filePath: tab.getPath(),
+						fileHandle: tab.getFileHandle(),
+					})
+				)
+				inactiveTabSystem.setActive(true)
+			},
+		})
+
 		this.commandData.loadCommandData('minecraftBedrock')
+		this.langData.loadLangData('minecraftBedrock')
+		this.colorData.loadColorData()
 	}
 
 	getCurrentDataPackage() {

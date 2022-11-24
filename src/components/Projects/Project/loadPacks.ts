@@ -1,34 +1,35 @@
 import { App } from '/@/App'
-import { IPackType, PackType } from '/@/components/Data/PackType'
+import { IPackType, TPackTypeId } from '/@/components/Data/PackType'
 import { loadManifest } from './loadManifest'
+import type { Project } from './Project'
 
 export interface IPackData extends IPackType {
 	version: number[]
+	packPath: string
+	uuid?: string
 }
 
-export async function loadPacks(app: App, projectName: string) {
-	await PackType.ready.fired
-	const handles = await app.fileSystem.readdir(`projects/${projectName}`, {
-		withFileTypes: true,
-	})
+export async function loadPacks(app: App, project: Project) {
+	await App.packType.ready.fired
 	const packs: IPackData[] = []
+	const config = project.config
+	const definedPacks = config.getAvailablePacks()
 
-	for (const handle of handles) {
-		if (handle.kind !== 'directory') continue
-
-		// Check whether handle is a valid pack
-		const packType = PackType.get(`projects/${projectName}/${handle.name}`)
-		if (!packType) continue
-
+	for (const [packId, packPath] of Object.entries(definedPacks)) {
 		// Load pack manifest
 		let manifest: any = {}
 		try {
-			manifest = await loadManifest(app, projectName, handle.name)
+			manifest = await loadManifest(
+				app,
+				config.resolvePackPath(<TPackTypeId>packId, 'manifest.json')
+			)
 		} catch {}
 
 		packs.push({
-			...packType,
+			...App.packType.getFromId(<TPackTypeId>packId)!,
+			packPath,
 			version: manifest?.header?.version ?? [1, 0, 0],
+			uuid: manifest?.header?.uuid,
 		})
 	}
 

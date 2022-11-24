@@ -3,7 +3,7 @@
 		class="font-weight-black clickable px-1"
 		style="display: inline-block; width: fit-content"
 		v-ripple
-		@click="openFile(filePath)"
+		@click="openFile"
 	>
 		<v-icon
 			style="position: relative; top: -2px"
@@ -12,34 +12,31 @@
 		>
 			{{ getFileIcon(filePath) }}
 		</v-icon>
-		{{ filePath }}
+		{{ displayFilePath }}
 	</div>
 </template>
 
 <script>
 import { App } from '/@/App.ts'
-import { FileType } from '/@/components/Data/FileType.ts'
-import { PackType } from '/@/components/Data/PackType.ts'
 
 export default {
 	name: 'FileName',
 	props: {
+		displayFilePath: String,
 		filePath: String,
+		fileHandle: {},
 	},
 	methods: {
 		getFileIcon(filePath) {
-			return (FileType.get(filePath) || {}).icon ?? 'mdi-file-outline'
+			return (App.fileType.get(filePath) || {}).icon ?? 'mdi-file-outline'
 		},
 		getIconColor(filePath) {
-			return (PackType.getWithRelativePath(filePath) || {}).color
+			return (App.packType.get(filePath) || {}).color
 		},
-		async openFile(filePath) {
+		async openFile() {
 			const app = await App.getApp()
 
-			const fileHandle = await app.fileSystem.getFileHandle(
-				`projects/${app.project.name}/${filePath}`
-			)
-			app.project.openFile(fileHandle)
+			app.project.openFile(this.fileHandle)
 		},
 	},
 }

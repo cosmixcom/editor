@@ -7,27 +7,34 @@ export const tokenProvider: any = {
 		['{', '}', 'delimiter.curly'],
 	],
 	keywords: [],
-	selectors: ['@a', '@e', '@p', '@r', '@s'],
+	selectors: ['@a', '@e', '@p', '@r', '@s', '@initiator'],
+	targetSelectorArguments: [],
+
 	tokenizer: {
 		root: [
 			[/#.*/, 'comment'],
 
 			[
-				/{/,
+				/\{/,
 				{
-					token: '@rematch',
+					token: 'delimiter.bracket',
+					bracket: '@open',
 					next: '@embeddedJson',
-					nextEmbedded: 'json',
 				},
 			],
-			[/"[^"]*"|'[^']*'/, 'string'],
-			[/\=|\,|\!|%=|\*=|\+=|-=|\/=|<|=|>|<>/, 'definition'],
-			[/true|false/, 'number'],
-			[/-?([0-9]+(\.[0-9]+)?)|(\~|\^-?([0-9]+(\.[0-9]+)?)?)/, 'number'],
+			[
+				/\[/,
+				{
+					token: 'delimiter.bracket',
+					next: '@targetSelectorArguments',
+					bracket: '@open',
+				},
+			],
+			{ include: '@common' },
 			...colorCodes,
 
 			[
-				/[a-z_$][\w$]*/,
+				/[a-z_][\w\/]*/,
 				{
 					cases: {
 						'@keywords': 'keyword',
@@ -36,7 +43,7 @@ export const tokenProvider: any = {
 				},
 			],
 			[
-				/@[a|p|r|e|s]/,
+				/(@[a-z]+)/,
 				{
 					cases: {
 						'@selectors': 'type.identifier',
@@ -45,15 +52,43 @@ export const tokenProvider: any = {
 				},
 			],
 		],
+
+		common: [
+			[/(\\)?"[^"]*"|'[^']*'/, 'string'],
+			[/\=|\,|\!|%=|\*=|\+=|-=|\/=|<|=|>|<>/, 'definition'],
+			[/true|false/, 'number'],
+			[/-?([0-9]+(\.[0-9]+)?)|((\~|\^)-?([0-9]+(\.[0-9]+)?)?)/, 'number'],
+		],
+
 		embeddedJson: [
+			[/\{/, 'delimiter.bracket', '@embeddedJson'],
+			[/\}/, 'delimiter.bracket', '@pop'],
+			{ include: '@common' },
+		],
+		targetSelectorArguments: [
+			[/\]/, { token: '@brackets', bracket: '@close', next: '@pop' }],
 			[
-				/} *?[^,]/,
+				/{/,
 				{
-					token: '@rematch',
-					next: '@pop',
-					nextEmbedded: '@pop',
+					token: '@brackets',
+					bracket: '@open',
+					next: '@targetSelectorScore',
 				},
 			],
+			[
+				/[a-z_][\w\/]*/,
+				{
+					cases: {
+						'@targetSelectorArguments': 'variable',
+						'@default': 'identifier',
+					},
+				},
+			],
+			{ include: '@common' },
+		],
+		targetSelectorScore: [
+			[/}/, { token: '@brackets', bracket: '@close', next: '@pop' }],
+			{ include: '@common' },
 		],
 	},
 }

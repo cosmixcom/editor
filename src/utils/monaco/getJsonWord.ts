@@ -1,9 +1,17 @@
-import { editor, Position, Range } from 'monaco-editor'
+import type { editor, Position } from 'monaco-editor'
+import { useMonaco } from '../libs/useMonaco'
 
-export function getJsonWordAtPosition(
+/**
+ * Gets the range and word of a json string from a position in a text model
+ * @param model The text model that the string is in
+ * @param position The position inside of the json string to get
+ * @returns An object with 'word' and 'range' properties, containing the word in the json string and the range, in the model, of the string. NOTE - the column is zero-based so when using this to set monaco editor markers the columns should be adjusted to represent the entire json word
+ */
+export async function getJsonWordAtPosition(
 	model: editor.ITextModel,
 	position: Position
 ) {
+	const { Range } = await useMonaco()
 	const line = model.getLineContent(position.lineNumber)
 
 	const wordStart = getPreviousQuote(line, position.column)

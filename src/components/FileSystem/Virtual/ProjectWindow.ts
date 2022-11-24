@@ -4,7 +4,7 @@ import { App } from '/@/App'
 import { importNewProject } from '/@/components/Projects/Import/ImportNew'
 
 export async function createVirtualProjectWindow() {
-	// TODO: Prompt user whether to open new project or to save the current one
+	// Prompt user whether to open new project or to save the current one
 	const choiceWindow = new InformedChoiceWindow(
 		'windows.projectChooser.title',
 		{
@@ -16,7 +16,7 @@ export async function createVirtualProjectWindow() {
 	actions.create({
 		icon: 'mdi-plus',
 		name: 'windows.projectChooser.newProject.name',
-		description: 'windows.projectChooser.saveCurrentProject.description',
+		description: 'windows.projectChooser.newProject.description',
 		onTrigger: async () => {
 			const app = await App.getApp()
 			app.windows.createProject.open()

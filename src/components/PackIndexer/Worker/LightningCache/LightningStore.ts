@@ -1,5 +1,9 @@
-import { FileType, IMonacoSchemaArrayEntry } from '/@/components/Data/FileType'
+import {
+	FileTypeLibrary,
+	IMonacoSchemaArrayEntry,
+} from '/@/components/Data/FileType'
 import type { FileSystem } from '/@/components/FileSystem/FileSystem'
+import { join } from '/@/utils/path'
 
 type TStore = Record<string, Record<string, IStoreEntry>>
 interface IStoreEntry {
@@ -17,7 +21,11 @@ export class LightningStore {
 	protected fs: FileSystem
 	protected _visitedFiles = 0
 	protected _totalFiles = 0
-	constructor(fs: FileSystem) {
+	constructor(
+		fs: FileSystem,
+		protected fileType: FileTypeLibrary,
+		protected projectPath: string
+	) {
 		this.fs = fs
 	}
 
@@ -43,6 +51,18 @@ export class LightningStore {
 
 		this.store = {}
 		this._visitedFiles = 0
+		this._totalFiles = 0
+		if (loadStore.length === 0) return
+
+		let formatVersion = 0
+		if (loadStore[0].startsWith('$formatVersion: ')) {
+			// Load formatVersion from string with format "$formatVersion: [number]"
+			formatVersion = Number(loadStore[0].match(/\d+/)?.[0] ?? 0)
+			loadStore.shift()
+		}
+
+		const projectPrefix = this.projectPath
+
 		let currentFileType = 'unknown'
 		for (const definition of loadStore) {
 			if (definition === '') continue
@@ -52,7 +72,11 @@ export class LightningStore {
 				continue
 			}
 
-			const [filePath, lastModified, data] = definition.split('|')
+			let [filePath, lastModified, data] = definition.split('|')
+			if (formatVersion === 0) {
+				filePath = join(projectPrefix, filePath)
+			}
+
 			this._totalFiles++
 			this.store[currentFileType][filePath] = {
 				lastModified: Number(lastModified),
@@ -60,8 +84,8 @@ export class LightningStore {
 			}
 		}
 	}
-	async saveStore() {
-		let saveStore = ''
+	async saveStore(checkVisited = true) {
+		let saveStore = `$formatVersion: 1\n`
 		const deletedFiles: string[] = []
 
 		for (const fileType in this.store) {
@@ -76,7 +100,7 @@ export class LightningStore {
 				}
 
 				// This file no longer seems to exist, omit it from store output
-				if (!entry.visited) {
+				if (checkVisited && !entry.visited) {
 					deletedFiles.push(filePath)
 					delete this.store[fileType][filePath]
 					continue
@@ -87,7 +111,6 @@ export class LightningStore {
 				else saveStore += '\n'
 			}
 		}
-
 		await this.fs.writeFile('.bridge/.lightningCache', saveStore)
 
 		return deletedFiles
@@ -100,7 +123,7 @@ export class LightningStore {
 			data,
 			isForeignFile,
 		}: IStoreEntry & { data?: Record<string, string[]> },
-		fileType = FileType.getId(filePath)
+		fileType = this.fileType.getId(filePath)
 	) {
 		if (!this.store![fileType]) this.store![fileType] = {}
 
@@ -114,15 +137,37 @@ export class LightningStore {
 			data: data ?? this.store![fileType]?.[filePath]?.data,
 		}
 	}
-	remove(filePath: string, fileType = FileType.getId(filePath)) {
+	remove(filePath: string, fileType = this.fileType.getId(filePath)) {
 		if (!this.store![fileType]) return
 
 		delete this.store![fileType][filePath]
 	}
+	rename(fromPath: string, toPath: string) {
+		// Store whether fromPath is a file path (ends with extension)
+		const isFilePath = /\.\w+$/.test(fromPath)
+
+		for (const fileType in this.store) {
+			for (const filePath in this.store[fileType]) {
+				if (
+					(isFilePath && filePath === fromPath) ||
+					(!isFilePath && filePath.startsWith(fromPath))
+				) {
+					const composedNewPath = filePath.replace(fromPath, toPath)
+					const newFileType = this.fileType.getId(composedNewPath)
+
+					this.store[newFileType][composedNewPath] =
+						this.store[fileType][filePath]
+
+					delete this.store[fileType][filePath]
+				}
+			}
+		}
+	}
+
 	setVisited(
 		filePath: string,
 		visited: boolean,
-		fileType = FileType.getId(filePath)
+		fileType = this.fileType.getId(filePath)
 	) {
 		this._visitedFiles++
 
@@ -131,7 +176,10 @@ export class LightningStore {
 		}
 	}
 
-	getLastModified(filePath: string, fileType = FileType.getId(filePath)) {
+	getLastModified(
+		filePath: string,
+		fileType = this.fileType.getId(filePath)
+	) {
 		return this.store![fileType]?.[filePath]?.lastModified
 	}
 
@@ -196,19 +244,31 @@ export class LightningStore {
 		await Promise.all(promises)
 	}
 
-	get(filePath: string, fileType = FileType.getId(filePath)) {
+	get(filePath: string, fileType = this.fileType.getId(filePath)) {
 		return this.store![fileType]?.[filePath] ?? {}
 	}
-	has(filePath: string, fileType = FileType.getId(filePath)) {
+	has(filePath: string, fileType = this.fileType.getId(filePath)) {
 		return !!this.store![fileType]?.[filePath]
 	}
 
-	allFiles() {
+	allFiles(searchFileType?: string) {
 		const filePaths = []
 
-		for (const fileType in this.store) {
-			for (const filePath in this.store[fileType]) {
+		if (searchFileType && this.store) {
+			for (const filePath in this.store[searchFileType]) {
+				// Exclude foreign files from result
+				if (this.store[searchFileType][filePath].isForeignFile) continue
+
 				filePaths.push(filePath)
+			}
+		} else {
+			for (const fileType in this.store) {
+				for (const filePath in this.store[fileType]) {
+					// Exclude foreign files from result
+					if (this.store[fileType][filePath].isForeignFile) continue
+
+					filePaths.push(filePath)
+				}
 			}
 		}
 
@@ -229,6 +289,11 @@ export class LightningStore {
 					collectedData[cacheKey].push(...cachedData[cacheKey])
 				else collectedData[cacheKey] = [...cachedData[cacheKey]]
 			}
+		}
+
+		// Remove duplicates from array using a set
+		for (const cacheKey in collectedData) {
+			collectedData[cacheKey] = [...new Set(collectedData[cacheKey])]
 		}
 
 		return collectedData

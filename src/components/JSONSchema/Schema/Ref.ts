@@ -4,9 +4,13 @@ import { Schema } from './Schema'
 import { dirname, join } from '/@/utils/path'
 
 export class RefSchema extends Schema {
-	public readonly type = 'refSchema'
+	public readonly schemaType = 'refSchema'
 
 	protected rootSchema: RootSchema
+	get types() {
+		return this.rootSchema.types
+	}
+
 	constructor(location: string, key: string, value: unknown) {
 		super(location, key, value)
 
@@ -15,13 +19,19 @@ export class RefSchema extends Schema {
 				`Invalid $ref type "${typeof value}": ${JSON.stringify(value)}`
 			)
 
-		if (value === '#') {
+		if (value.startsWith('#')) {
+			const baseLoc = this.location.split('#/')[0]
+			const locWithHash = value === '#' ? baseLoc : `${baseLoc}${value}`
+
 			this.rootSchema =
-				SchemaManager.requestRootSchema(this.location) ??
+				SchemaManager.requestRootSchema(locWithHash) ??
 				new RootSchema(
-					this.location,
+					locWithHash,
 					'$ref',
-					SchemaManager.request(this.location)
+					SchemaManager.request(
+						baseLoc,
+						value === '#' ? undefined : value.replace('#/', '')
+					)
 				)
 		} else {
 			const dir = this.location.includes('#/')
@@ -57,7 +67,7 @@ export class RefSchema extends Schema {
 	validate(obj: string) {
 		return this.rootSchema.validate(obj)
 	}
-	getSchemasFor(obj: unknown, location: (string | number)[]) {
+	getSchemasFor(obj: unknown, location: (string | number | undefined)[]) {
 		return this.rootSchema.getSchemasFor(obj, [...location])
 	}
 

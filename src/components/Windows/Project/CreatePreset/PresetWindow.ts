@@ -1,22 +1,27 @@
 import { Sidebar, SidebarCategory } from '/@/components/Windows/Layout/Sidebar'
 import PresetWindowComponent from './PresetWindow.vue'
-import { BaseWindow } from '../../BaseWindow'
 import { FileSystem } from '/@/components/FileSystem/FileSystem'
 import { App } from '/@/App'
 import { v4 as uuid } from 'uuid'
 import { dirname } from '/@/utils/path'
-import { compare, CompareOperator } from 'compare-versions'
 import { runPresetScript } from './PresetScript'
 import { expandFile, TExpandFile } from './ExpandFile'
 import { createFile, TCreateFile } from './CreateFile'
-import { PackType, TPackTypeId } from '/@/components/Data/PackType'
+import { TPackTypeId } from '/@/components/Data/PackType'
 import { transformString } from './TransformString'
 import { ConfirmationWindow } from '../../Common/Confirm/ConfirmWindow'
-import { getLatestFormatVersion } from '/@/components/Data/FormatVersions'
 import { PresetItem } from './PresetItem'
 import { DataLoader } from '/@/components/Data/DataLoader'
 import { AnyFileHandle, AnyHandle } from '/@/components/FileSystem/Types'
-import { IRequirements, RequiresMatcher } from '../../../Data/RequiresMatcher'
+import {
+	IRequirements,
+	RequiresMatcher,
+} from '/@/components/Data/RequiresMatcher/RequiresMatcher'
+import { createFailureMessage } from '/@/components/Data/RequiresMatcher/FailureMessage'
+import json5 from 'json5'
+import { markRaw, reactive, Ref, ref } from 'vue'
+import { translate } from '/@/components/Locales/Manager'
+import { NewBaseWindow } from '../../NewBaseWindow'
 
 export interface IPresetManifest {
 	name: string
@@ -30,6 +35,7 @@ export interface IPresetManifest {
 	createFiles?: (string | TCreateFile)[]
 	expandFiles?: TExpandFile[]
 	requires: IRequirements
+	showIfDisabled?: boolean
 }
 export interface IPresetFieldOpts {
 	// All types
@@ -52,6 +58,7 @@ export interface IPresetFieldOpts {
 export interface IPresetFileOpts {
 	inject: string[]
 	openFile?: boolean
+	packPath?: TPackTypeId
 }
 
 export interface IPermissions {
@@ -59,9 +66,9 @@ export interface IPermissions {
 	mayOverwriteUnsavedChanges?: boolean
 }
 
-export class CreatePresetWindow extends BaseWindow {
-	protected loadPresetPaths = new Map<string, string>()
-	protected sidebar = new Sidebar([])
+export class CreatePresetWindow extends NewBaseWindow {
+	protected loadPresetPaths = new Set<string>()
+	public sidebar = new Sidebar([])
 	protected shouldReloadPresets = true
 	protected modelResetters: (() => void)[] = []
 
@@ -74,6 +81,7 @@ export class CreatePresetWindow extends BaseWindow {
 			value.match(/^[a-zA-Z0-9_\.]*$/) !== null,
 		lowercase: (value: string) => value.toLowerCase() === value,
 		required: (value: string) => !!value,
+		numeric: (value: string) => !isNaN(Number(value)),
 	}
 
 	/**
@@ -87,9 +95,7 @@ export class CreatePresetWindow extends BaseWindow {
 				key,
 				(value: string) =>
 					func(value) ||
-					App.instance.locales.translate(
-						`windows.createPreset.validationRule.${key}`
-					),
+					translate(`windows.createPreset.validationRule.${key}`),
 			])
 		)
 	}
@@ -98,23 +104,20 @@ export class CreatePresetWindow extends BaseWindow {
 		super(PresetWindowComponent)
 		this.defineWindow()
 
-		App.eventSystem.on('presetsChanged', () => {
-			this.shouldReloadPresets = true
-		})
+		const reloadEvents = ['presetsChanged', 'projectChanged']
+
+		reloadEvents.forEach((eventName) =>
+			App.eventSystem.on(eventName, () => this.onPresetsChanged())
+		)
 	}
 
-	protected async addPreset(
-		fs: FileSystem | DataLoader,
-		manifestPath: string
-	) {
+	onPresetsChanged() {
+		this.shouldReloadPresets = true
+	}
+
+	protected requiresMatcher = markRaw(new RequiresMatcher())
+	protected async addPreset(manifestPath: string, manifest: IPresetManifest) {
 		const app = await App.getApp()
-		// Load manifest
-		let manifest: IPresetManifest
-		try {
-			manifest = <IPresetManifest>await fs.readJSON(manifestPath)
-		} catch (err) {
-			return
-		}
 
 		// Presets need a category, presets without category are most likely incompatible v1 presets
 		if (!manifest.category)
@@ -122,8 +125,8 @@ export class CreatePresetWindow extends BaseWindow {
 				`Error loading ${manifestPath}: Missing preset category`
 			)
 
-		const requiresMatcher = new RequiresMatcher(manifest.requires)
-		if (!(await requiresMatcher.isValid())) return
+		const mayUsePreset = this.requiresMatcher.isValid(manifest.requires)
+		if (!mayUsePreset && manifest.showIfDisabled === false) return
 
 		let category = <SidebarCategory | undefined>(
 			this.sidebar.rawElements.find(
@@ -156,11 +159,12 @@ export class CreatePresetWindow extends BaseWindow {
 					fieldOpts.options = []
 					fieldOpts.isLoading = true
 					app.project.packIndexer.once(async () => {
-						const options = await app.project.packIndexer.service.getCacheDataFor(
-							fileType,
-							undefined,
-							cacheKey
-						)
+						const options =
+							await app.project.packIndexer.service.getCacheDataFor(
+								fileType,
+								undefined,
+								cacheKey
+							)
 
 						fieldOpts.options = options ?? []
 						fieldOpts.isLoading = false
@@ -188,13 +192,21 @@ export class CreatePresetWindow extends BaseWindow {
 			})
 		}
 
-		const presetPath = manifest.additionalModels?.PRESET_PATH
 		const iconColor =
-			typeof presetPath === 'string' &&
-			manifest.category === 'fileType.simpleFile'
-				? PackType.getWithRelativePath(presetPath + 'test.json')
+			manifest.category === 'fileType.simpleFile' &&
+			manifest.requires?.packTypes &&
+			manifest.requires.packTypes.length > 0
+				? App.packType.getFromId(manifest.requires.packTypes[0])
 						?.color ?? 'primary'
 				: 'primary'
+
+		let failureMessage: string | undefined
+		if (this.requiresMatcher.failures.length > 0) {
+			failureMessage = await createFailureMessage(
+				this.requiresMatcher.failures[0],
+				manifest.requires
+			)
+		}
 
 		category.addItem(
 			new PresetItem({
@@ -202,6 +214,8 @@ export class CreatePresetWindow extends BaseWindow {
 				text: manifest.name,
 				icon: manifest.icon,
 				color: iconColor,
+				isDisabled: !mayUsePreset,
+				disabledText: failureMessage,
 				resetState,
 			})
 		)
@@ -216,17 +230,69 @@ export class CreatePresetWindow extends BaseWindow {
 	) {
 		await fs.fired
 
+		// Use shortcut presets.json file if available
+		if (
+			dirPath.endsWith('presets.json') &&
+			(await fs.fileExists(dirPath))
+		) {
+			const presets = await fs.readJSON(dirPath)
+
+			await Promise.all(
+				Object.entries<any>(presets).map(([presetPath, manifest]) =>
+					this.addPreset(
+						`${dirname(dirPath)}/${presetPath}`,
+						manifest
+					)
+				)
+			)
+			return
+		}
+
 		let dirents: AnyHandle[] = []
 		try {
 			dirents = await fs.readdir(dirPath, { withFileTypes: true })
 		} catch {}
 
+		const promises = []
 		for (const dirent of dirents) {
 			if (dirent.kind === 'directory')
-				await this.loadPresets(fs, `${dirPath}/${dirent.name}`)
-			else if (dirent.name === 'manifest.json')
-				return await this.addPreset(fs, `${dirPath}/${dirent.name}`)
+				promises.push(this.loadPresets(fs, `${dirPath}/${dirent.name}`))
+			else if (dirent.name === 'manifest.json') {
+				let manifest
+				try {
+					manifest = json5.parse(
+						await dirent.getFile().then((file) => file.text())
+					)
+				} catch (originalError: any) {
+					const error = new Error(
+						`Failed to load JSON file "${dirPath}/${dirent.name}".`
+					)
+					// @ts-ignore TypeScript doesn't know about error.cause yet
+					error.cause = originalError
+
+					console.error(error)
+					continue
+				}
+
+				promises.push(
+					await this.addPreset(`${dirPath}/${dirent.name}`, manifest)
+				)
+			}
 		}
+
+		await Promise.all(promises)
+	}
+
+	async loadDefaultPresets(dataLoader: DataLoader) {
+		const presets = await dataLoader.readJSON(
+			'data/packages/minecraftBedrock/presets.json'
+		)
+
+		await Promise.all(
+			Object.entries<any>(presets).map(([presetPath, manifest]) =>
+				this.addPreset(presetPath, manifest)
+			)
+		)
 	}
 
 	async open() {
@@ -237,9 +303,16 @@ export class CreatePresetWindow extends BaseWindow {
 		if (this.shouldReloadPresets) {
 			this.sidebar.removeElements()
 
-			await this.loadPresets(app.dataLoader)
-			for (const [_, loadPresetPath] of this.loadPresetPaths)
-				await this.loadPresets(fs, loadPresetPath)
+			// Reset requires matcher
+			this.requiresMatcher = markRaw(new RequiresMatcher())
+			await this.requiresMatcher.setup()
+
+			await Promise.all([
+				this.loadDefaultPresets(app.dataLoader),
+				...[...this.loadPresetPaths].map((loadPresetPath) =>
+					this.loadPresets(fs, loadPresetPath)
+				),
+			])
 
 			this.sidebar.setDefaultSelected()
 			this.shouldReloadPresets = false
@@ -251,11 +324,10 @@ export class CreatePresetWindow extends BaseWindow {
 		super.open()
 	}
 	addPresets(folderPath: string) {
-		const id = uuid()
-		this.loadPresetPaths.set(id, folderPath)
+		this.loadPresetPaths.add(folderPath)
 
 		return {
-			dispose: () => this.loadPresetPaths.delete(id),
+			dispose: () => this.loadPresetPaths.delete(folderPath),
 		}
 	}
 
@@ -268,7 +340,7 @@ export class CreatePresetWindow extends BaseWindow {
 
 		const app = await App.getApp()
 		app.windows.loadingWindow.open()
-		const fs = app.project!.fileSystem
+		const projectFs = app.project!.fileSystem
 
 		const createdFiles: AnyFileHandle[] = []
 		const permissions: IPermissions = {
@@ -285,7 +357,7 @@ export class CreatePresetWindow extends BaseWindow {
 				createFile[2]?.inject ?? [],
 				this.sidebar.currentState.models
 			)
-			if (await fs.fileExists(filePath)) {
+			if (await projectFs.fileExists(filePath)) {
 				const confirmWindow = new ConfirmationWindow({
 					description: 'windows.createPreset.overwriteFiles',
 					confirmText: 'windows.createPreset.overwriteFilesConfirm',
@@ -384,7 +456,7 @@ export class CreatePresetWindow extends BaseWindow {
 
 		const filePaths: string[] = []
 		for (const fileHandle of createdFiles) {
-			const filePath = await app.project.getProjectPath(fileHandle)
+			const filePath = await app.fileSystem.pathTo(fileHandle)
 			if (!filePath) continue
 
 			filePaths.push(filePath)
@@ -395,7 +467,7 @@ export class CreatePresetWindow extends BaseWindow {
 				})
 		}
 
-		await app.project.updateFiles(filePaths)
+		app.project.updateFiles(filePaths)
 
 		// Reset preset inputs
 		if (this.sidebar.currentElement instanceof PresetItem)

@@ -2,9 +2,6 @@ import { DropdownWindow } from '/@/components/Windows/Common/Dropdown/DropdownWi
 import { App } from '/@/App'
 import { ZipDirectory } from '/@/components/FileSystem/Zip/ZipDirectory'
 import { saveOrDownload } from '/@/components/FileSystem/saveOrDownload'
-import { InformationWindow } from '/@/components/Windows/Common/Information/InformationWindow'
-import { isUsingFileSystemPolyfill } from '/@/components/FileSystem/Polyfill'
-import { createNotification } from '/@/components/Notifications/create'
 import { v4 as uuid } from 'uuid'
 import { getLatestFormatVersion } from '../../Data/FormatVersions'
 
@@ -14,7 +11,9 @@ export async function exportAsMctemplate(asMcworld = false) {
 	const fs = project.fileSystem
 	app.windows.loadingWindow.open()
 
-	await app.project.compilerManager.start('default', 'build')
+	const service = await app.project.createDashService('production')
+	await service.setup()
+	await service.build()
 
 	let baseWorlds: string[] = []
 
@@ -34,7 +33,7 @@ export async function exportAsMctemplate(asMcworld = false) {
 	} else {
 		const optionsWindow = new DropdownWindow({
 			default: baseWorlds[0],
-			name: 'windows.packExplorer.exportAsMctemplate.chooseWorld',
+			name: 'packExplorer.exportAsMctemplate.chooseWorld',
 			options: baseWorlds,
 		})
 
@@ -135,7 +134,9 @@ export async function exportAsMctemplate(asMcworld = false) {
 				base_game_version: (
 					app.project.config.get().targetVersion ??
 					(await getLatestFormatVersion())
-				).split('.'),
+				)
+					.split('.')
+					.map((str) => Number(str)),
 			},
 			modules: [
 				{
@@ -155,7 +156,7 @@ export async function exportAsMctemplate(asMcworld = false) {
 			create: true,
 		})
 	)
-	const savePath = `projects/${app.project.name}/builds/${app.project.name}.${
+	const savePath = `${app.project.projectPath}/builds/${app.project.name}.${
 		asMcworld ? 'mcworld' : 'mctemplate'
 	}`
 

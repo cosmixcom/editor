@@ -1,18 +1,17 @@
-import { FileType } from '/@/components/Data/FileType'
 import { run } from '/@/components/Extensions/Scripts/run'
-import { walkObject } from '/@/utils/walkObject'
+import { walkObject } from 'bridge-common-utils'
 import json5 from 'json5'
 import type { PackIndexerService } from '../Main'
 import type { LightningStore } from './LightningStore'
 import { runScript } from './Script'
-import { basename, extname } from '/@/utils/path'
-import { findFileExtension } from '/@/components/FileSystem/FindFile'
-import { iterateDir } from '/@/utils/iterateDir'
+import { basename, extname, join } from '/@/utils/path'
 import {
 	AnyDirectoryHandle,
 	AnyFileHandle,
 	AnyHandle,
 } from '/@/components/FileSystem/Types'
+import { TPackTypeId } from '/@/components/Data/PackType'
+import { getCacheScriptEnv } from './CacheEnv'
 
 const knownTextFiles = new Set([
 	'.js',
@@ -43,9 +42,13 @@ export class LightningCache {
 		protected lightningStore: LightningStore
 	) {}
 
+	get fileType() {
+		return this.service.fileType
+	}
+
 	async loadIgnoreFolders() {
 		try {
-			const file = await this.service.fileSystem.readFile(
+			const file = await this.service.projectFileSystem.readFile(
 				'.bridge/.ignoreFolders'
 			)
 			;(await file.text())
@@ -77,23 +80,48 @@ export class LightningCache {
 		let anyFileChanged = false
 		const filePaths: string[] = []
 		const changedFiles: string[] = []
-		await this.iterateDir(
-			this.service.fileSystem.baseDirectory,
-			async (fileHandle, filePath) => {
-				const fileDidChange = await this.processFile(
-					filePath,
-					fileHandle
-				)
 
-				if (fileDidChange) {
-					if (!anyFileChanged) anyFileChanged = true
-					changedFiles.push(filePath)
-				}
-				filePaths.push(filePath)
-
-				this.service.progress.addToCurrent()
-			}
+		const availablePackPaths = this.service.config.getAvailablePackPaths()
+		// Find directory handles matching each available pack
+		const directoryHandles = await Promise.all(
+			availablePackPaths.map(
+				async (packPath) =>
+					<const>[
+						packPath,
+						await this.service.fileSystem
+							.getDirectoryHandle(packPath)
+							.catch(() => undefined),
+					]
+			)
 		)
+
+		for (const [packPath, directoryHandle] of directoryHandles) {
+			if (!directoryHandle) {
+				console.warn(
+					`Cannot index pack "${packPath}" because it does not exist`
+				)
+				continue
+			}
+
+			await this.iterateDir(
+				directoryHandle,
+				async (fileHandle, filePath) => {
+					filePath = join(packPath, filePath)
+					const fileDidChange = await this.processFile(
+						filePath,
+						fileHandle
+					)
+
+					if (fileDidChange) {
+						if (!anyFileChanged) anyFileChanged = true
+						changedFiles.push(filePath)
+					}
+					filePaths.push(filePath)
+
+					this.service.progress.addToCurrent()
+				}
+			)
+		}
 
 		let deletedFiles: string[] = []
 		if (
@@ -104,27 +132,10 @@ export class LightningCache {
 		return [filePaths, changedFiles, deletedFiles]
 	}
 
-	async unlink(path: string) {
-		let handle: AnyHandle | undefined
-		try {
-			handle = await this.service.fileSystem.getFileHandle(path)
-		} catch {
-			try {
-				handle = await this.service.fileSystem.getDirectoryHandle(path)
-			} catch {}
-		}
+	async unlinkFile(path: string, saveCache = true) {
+		this.lightningStore.remove(path)
 
-		if (!handle) return
-		else if (handle.kind === 'file') this.lightningStore.remove(path)
-		else if (handle.kind === 'directory')
-			await iterateDir(
-				handle,
-				(_, filePath) => this.lightningStore.remove(filePath),
-				undefined,
-				path
-			)
-
-		await this.lightningStore.saveStore()
+		if (saveCache) await this.lightningStore.saveStore(false)
 	}
 
 	protected async iterateDir(
@@ -135,18 +146,22 @@ export class LightningCache {
 		) => void | Promise<void>,
 		fullPath = ''
 	) {
+		const promises = []
+
 		for await (const [fileName, entry] of baseDir.entries()) {
 			const currentFullPath =
 				fullPath.length === 0 ? fileName : `${fullPath}/${fileName}`
 
 			if (entry.kind === 'directory') {
 				if (this.folderIgnoreList.has(currentFullPath)) continue
-				await this.iterateDir(entry, callback, currentFullPath)
+				promises.push(this.iterateDir(entry, callback, currentFullPath))
 			} else if (fileName[0] !== '.') {
 				this.service.progress.addToTotal(2)
-				await callback(<AnyFileHandle>entry, currentFullPath)
+				promises.push(callback(<AnyFileHandle>entry, currentFullPath))
 			}
 		}
+
+		await Promise.allSettled(promises)
 	}
 
 	/**
@@ -162,7 +177,7 @@ export class LightningCache {
 		const file = receivedContent
 			? new File([fileHandleOrContent], basename(filePath))
 			: await fileHandleOrContent.getFile()
-		const fileType = FileType.getId(filePath)
+		const fileType = this.fileType.getId(filePath)
 
 		if (!file)
 			throw new Error(
@@ -184,7 +199,7 @@ export class LightningCache {
 		const ext = extname(filePath)
 
 		// Second step: Process file
-		if (FileType.isJsonFile(filePath)) {
+		if (this.fileType.isJsonFile(filePath)) {
 			await this.processJSON(
 				filePath,
 				fileType,
@@ -211,7 +226,7 @@ export class LightningCache {
 		file: File,
 		isForeignFile?: boolean
 	) {
-		const instructions = await FileType.getLightningCache(filePath)
+		const instructions = await this.fileType.getLightningCache(filePath)
 
 		// JavaScript cache API
 		if (typeof instructions === 'string') {
@@ -219,7 +234,10 @@ export class LightningCache {
 
 			// Only proceed if the script returned a function
 			if (typeof cacheFunction === 'function') {
-				const textData = cacheFunction(await file.text())
+				const textData = cacheFunction(await file.text(), {
+					resolvePackPath: (packId: TPackTypeId, filePath: string) =>
+						this.service.config.resolvePackPath(packId, filePath),
+				})
 
 				this.lightningStore.add(
 					filePath,
@@ -238,7 +256,7 @@ export class LightningCache {
 
 		this.lightningStore.add(
 			filePath,
-			{ lastModified: file.lastModified },
+			{ lastModified: file.lastModified, isForeignFile },
 			fileType
 		)
 	}
@@ -255,7 +273,7 @@ export class LightningCache {
 		isForeignFile?: boolean
 	) {
 		// Load instructions for current file
-		const instructions = await FileType.getLightningCache(filePath)
+		const instructions = await this.fileType.getLightningCache(filePath)
 
 		// No instructions = no work
 		if (instructions.length === 0 || typeof instructions === 'string') {
@@ -263,6 +281,7 @@ export class LightningCache {
 				filePath,
 				{
 					lastModified: file.lastModified,
+					isForeignFile,
 				},
 				fileType
 			)
@@ -271,6 +290,7 @@ export class LightningCache {
 
 		const isTemporaryUpdateCall = fileContent !== undefined
 		if (fileContent === undefined) fileContent = await file.text()
+		if (fileContent === '') fileContent = '{}'
 
 		// JSON API
 		let data: any
@@ -296,58 +316,50 @@ export class LightningCache {
 
 		// console.log(instructions)
 		const collectedData: Record<string, string[]> = {}
-		const asyncOnReceiveData = (
-			key: string,
-			filter?: string[],
-			mapFunc?: string
-		) => async (data: any) => {
-			let readyData: string[]
-			if (Array.isArray(data)) readyData = data
-			else if (typeof data === 'object')
-				readyData = Object.keys(data ?? {})
-			else readyData = [data]
+		const asyncOnReceiveData =
+			(key: string, filter?: string[], mapFunc?: string) =>
+			async (data: any) => {
+				let readyData: string[]
+				if (Array.isArray(data)) readyData = data
+				else if (typeof data === 'object')
+					readyData = Object.keys(data ?? {})
+				else readyData = [data]
 
-			if (filter) readyData = readyData.filter((d) => !filter.includes(d))
-			if (mapFunc)
-				readyData = (
-					await Promise.all(
-						readyData.map((value) =>
-							run({
-								async: true,
-								script: mapFunc,
-								env: {
-									Bridge: {
-										value,
-										withExtension: (
-											basePath: string,
-											extensions: string[]
-										) =>
-											findFileExtension(
-												this.service.fileSystem,
-												basePath,
-												extensions
-											),
+				if (filter)
+					readyData = readyData.filter((d) => !filter.includes(d))
+				if (mapFunc) {
+					const ctx = {
+						config: this.service.config,
+						fileSystem: this.service.fileSystem,
+					}
+
+					readyData = (
+						await Promise.all(
+							readyData.map((value) =>
+								run({
+									async: true,
+									script: mapFunc,
+									env: {
+										...getCacheScriptEnv(value, ctx),
 									},
-								},
-							})
+								})
+							)
 						)
-					)
-				).filter((value) => value !== undefined)
+					).filter((value) => value !== undefined)
+				}
 
-			if (!collectedData[key]) collectedData[key] = readyData
-			else
-				collectedData[key] = [
-					...new Set(collectedData[key].concat(readyData)),
-				]
-		}
+				if (!collectedData[key]) collectedData[key] = readyData
+				else
+					collectedData[key] = [
+						...new Set(collectedData[key].concat(readyData)),
+					]
+			}
 		const promises: Promise<unknown>[] = []
-		const onReceiveData = (
-			key: string,
-			filter?: string[],
-			mapFunc?: string
-		) => (data: any) => {
-			promises.push(asyncOnReceiveData(key, filter, mapFunc)(data))
-		}
+		const onReceiveData =
+			(key: string, filter?: string[], mapFunc?: string) =>
+			(data: any) => {
+				promises.push(asyncOnReceiveData(key, filter, mapFunc)(data))
+			}
 
 		for (const instruction of instructions) {
 			const key = instruction.cacheKey

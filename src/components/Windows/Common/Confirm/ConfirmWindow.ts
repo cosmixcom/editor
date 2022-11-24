@@ -1,6 +1,5 @@
-import { BaseWindow } from '/@/components/Windows/BaseWindow'
 import ConfirmWindowComponent from './ConfirmWindow.vue'
-import { App } from '/@/App'
+import { NewBaseWindow } from '../../NewBaseWindow'
 
 export interface IConfirmWindowOpts {
 	title?: string
@@ -9,9 +8,10 @@ export interface IConfirmWindowOpts {
 	cancelText?: string
 	onConfirm?: () => void
 	onCancel?: () => void
+	height?: number
 }
 
-export class ConfirmationWindow extends BaseWindow<boolean> {
+export class ConfirmationWindow extends NewBaseWindow<boolean> {
 	constructor(protected opts: IConfirmWindowOpts) {
 		super(ConfirmWindowComponent, true, false)
 		this.defineWindow()
@@ -30,14 +30,14 @@ export class ConfirmationWindow extends BaseWindow<boolean> {
 	get title() {
 		return this.opts.title ?? 'general.confirm'
 	}
-
+	get height() {
+		return this.opts.height ?? 130
+	}
 	onConfirm() {
-		App.audioManager.playAudio('click5.ogg', 1)
 		if (typeof this.opts.onConfirm === 'function') this.opts.onConfirm()
 		this.close(true)
 	}
 	onCancel() {
-		App.audioManager.playAudio('click5.ogg', 1)
 		if (typeof this.opts.onCancel === 'function') this.opts.onCancel()
 		this.close(false)
 	}

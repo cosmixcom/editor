@@ -1,7 +1,8 @@
 import { FileSystem } from '/@/components/FileSystem/FileSystem'
 import { ICreateProjectOptions } from '/@/components/Projects/CreateProject/CreateProject'
 import { CreateFile } from './CreateFile'
-import { PackType } from '/@/components/Data/PackType'
+import { TPackTypeId } from '/@/components/Data/PackType'
+import { defaultPackPaths } from '../../Project/Config'
 
 export class CreateConfig extends CreateFile {
 	public readonly id = 'bridgeConfig'
@@ -19,16 +20,19 @@ export class CreateConfig extends CreateFile {
 				targetVersion: createOptions.targetVersion,
 				description: createOptions.description,
 				experimentalGameplay: createOptions.experimentalGameplay,
+				bdsProject: createOptions.bdsProject,
 				packs: Object.fromEntries(
 					createOptions.packs
 						.filter((packId) => packId !== '.bridge')
 						.map((packId) => [
 							packId,
-							`./${PackType.getFromId(packId)?.packPath}`,
+							defaultPackPaths[<TPackTypeId>packId],
 						])
 				),
+				worlds: ['./worlds/*'],
 				compiler: {
 					plugins: [
+						'generatorScripts',
 						'typeScript',
 						'entityIdentifierAlias',
 						'customEntityComponents',
@@ -36,7 +40,13 @@ export class CreateConfig extends CreateFile {
 						'customBlockComponents',
 						'customCommands',
 						'moLang',
-						['simpleRewrite', { packName: createOptions.name }],
+						'formatVersionCorrection',
+						[
+							'simpleRewrite',
+							{
+								packName: createOptions.name,
+							},
+						],
 					],
 				},
 			},

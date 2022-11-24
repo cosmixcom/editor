@@ -1,7 +1,5 @@
 import { App } from '/@/App'
-import { FileType, IMonacoSchemaArrayEntry } from '/@/components/Data/FileType'
-import json5 from 'json5'
-import * as monaco from 'monaco-editor'
+import { IMonacoSchemaArrayEntry } from '/@/components/Data/FileType'
 import { Project } from '../Projects/Project/Project'
 import { IDisposable } from '/@/types/disposable'
 import { FileTab } from '../TabSystem/FileTab'
@@ -10,6 +8,9 @@ import { SchemaManager } from '../JSONSchema/Manager'
 import { EventDispatcher } from '../Common/Event/EventDispatcher'
 import { AnyFileHandle } from '../FileSystem/Types'
 import { Tab } from '../TabSystem/CommonTab'
+import { ComponentSchemas } from '../Compiler/Worker/Plugins/CustomComponent/ComponentSchemas'
+import { loadMonaco, useMonaco } from '../../utils/libs/useMonaco'
+import { Task } from '../TaskManager/Task'
 
 let globalSchemas: Record<string, IMonacoSchemaArrayEntry> = {}
 let loadedGlobalSchemas = false
@@ -18,6 +19,8 @@ export class JsonDefaults extends EventDispatcher<void> {
 	protected loadedSchemas = false
 	protected localSchemas: Record<string, IMonacoSchemaArrayEntry> = {}
 	protected disposables: IDisposable[] = []
+	public readonly componentSchemas = new ComponentSchemas()
+	protected task: Task | null = null
 
 	constructor(protected project: Project) {
 		super()
@@ -31,14 +34,16 @@ export class JsonDefaults extends EventDispatcher<void> {
 		console.time('[SETUP] JSONDefaults')
 		await this.project.app.project.packIndexer.fired
 
+		await this.componentSchemas.activate()
+
 		this.disposables = <IDisposable[]>[
 			// Updating currentContext/ references
 			App.eventSystem.on('currentTabSwitched', (tab: Tab) => {
 				if (
 					tab instanceof FileTab &&
-					FileType.isJsonFile(tab.getProjectPath())
+					App.fileType.isJsonFile(tab.getPath())
 				)
-					this.updateDynamicSchemas(tab.getProjectPath())
+					this.updateDynamicSchemas(tab.getPath())
 			}),
 			App.eventSystem.on('refreshCurrentContext', (filePath: string) =>
 				this.updateDynamicSchemas(filePath)
@@ -48,20 +53,23 @@ export class JsonDefaults extends EventDispatcher<void> {
 			}),
 		].filter((disposable) => disposable !== undefined)
 
-		if (!this.loadedSchemas) await this.loadAllSchemas()
-		this.setJSONDefaults()
+		await this.loadAllSchemas()
+		await this.setJSONDefaults()
 		console.timeEnd('[SETUP] JSONDefaults')
 	}
 
 	deactivate() {
 		this.disposables.forEach((disposable) => disposable.dispose())
+		this.componentSchemas.dispose()
 		this.disposables = []
+		this.task?.complete()
+		this.task = null
 	}
 
 	async loadAllSchemas() {
 		this.localSchemas = {}
 		const app = await App.getApp()
-		const task = app.taskManager.create({
+		this.task = app.taskManager.create({
 			icon: 'mdi-book-open-outline',
 			name: 'taskManager.tasks.loadingSchemas.name',
 			description: 'taskManager.tasks.loadingSchemas.description',
@@ -69,16 +77,18 @@ export class JsonDefaults extends EventDispatcher<void> {
 		})
 
 		await app.dataLoader.fired
-		task.update(1)
+		this.task?.update(1)
 		const packages = await app.dataLoader.readdir('data/packages')
-		task.update(2)
+		this.task?.update(2)
 
+		// Static schemas
 		for (const packageName of packages) {
 			try {
 				await this.loadStaticSchemas(
 					await app.dataLoader.getFileHandle(
 						`data/packages/${packageName}/schemas.json`
-					)
+					),
+					packageName === 'minecraftBedrock'
 				)
 			} catch (err) {
 				console.error(err)
@@ -86,42 +96,47 @@ export class JsonDefaults extends EventDispatcher<void> {
 			}
 		}
 		loadedGlobalSchemas = true
-		task.update(3)
+		this.task?.update(3)
 
-		this.addSchemas(await this.getDynamicSchemas())
-		task.update(4)
-
+		// Schema scripts
 		await this.runSchemaScripts(app)
-		task.update(5)
+		this.task?.update(5)
 		const tab = this.project.tabSystem?.selectedTab
 		if (tab && tab instanceof FileTab) {
-			const fileType = FileType.getId(tab.getProjectPath())
+			const fileType = App.fileType.getId(tab.getPath())
 			this.addSchemas(
-				await this.requestSchemaFor(fileType, tab.getProjectPath())
+				await this.requestSchemaFor(fileType, tab.getPath())
 			)
 			await this.runSchemaScripts(
 				app,
-				tab.isForeignFile ? undefined : tab.getProjectPath()
+				tab.isForeignFile ? undefined : tab.getPath()
 			)
 		}
 
+		// Schemas generated from lightning cache
+		this.addSchemas(await this.getDynamicSchemas())
+		this.task?.update(4)
+
 		this.loadedSchemas = true
-		task.update(6)
-		task.complete()
+		this.task?.update(6)
+		this.task?.complete()
 	}
 
-	setJSONDefaults(validate = true) {
-		monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
-			enableSchemaRequest: false,
-			allowComments: true,
-			validate,
-			schemas: Object.values(
-				Object.assign({}, globalSchemas, this.localSchemas)
-			),
-		})
-		SchemaManager.setJSONDefaults(
-			Object.assign({}, globalSchemas, this.localSchemas)
-		)
+	async setJSONDefaults(validate = true) {
+		const schemas = Object.assign({}, globalSchemas, this.localSchemas)
+
+		if (loadMonaco.hasFired) {
+			const { languages } = await useMonaco()
+
+			languages.json.jsonDefaults.setDiagnosticsOptions({
+				enableSchemaRequest: false,
+				allowComments: true,
+				validate,
+				schemas: Object.values(schemas),
+			})
+		}
+
+		SchemaManager.setJSONDefaults(schemas)
 
 		this.dispatch()
 	}
@@ -141,12 +156,12 @@ export class JsonDefaults extends EventDispatcher<void> {
 
 	async updateDynamicSchemas(filePath: string) {
 		const app = await App.getApp()
-		const fileType = FileType.getId(filePath)
+		const fileType = App.fileType.getId(filePath)
 
 		this.addSchemas(await this.requestSchemaFor(fileType, filePath))
 		this.addSchemas(await this.requestSchemaFor(fileType))
 		await this.runSchemaScripts(app, filePath)
-		this.setJSONDefaults()
+		await this.setJSONDefaults()
 	}
 	async updateMultipleDynamicSchemas(filePaths: string[]) {
 		const app = await App.getApp()
@@ -154,7 +169,7 @@ export class JsonDefaults extends EventDispatcher<void> {
 		const updatedFileTypes = new Set<string>()
 
 		for (const filePath of filePaths) {
-			const fileType = FileType.getId(filePath)
+			const fileType = App.fileType.getId(filePath)
 			if (updatedFileTypes.has(fileType)) continue
 
 			this.addSchemas(await this.requestSchemaFor(fileType))
@@ -162,7 +177,7 @@ export class JsonDefaults extends EventDispatcher<void> {
 			updatedFileTypes.add(fileType)
 		}
 
-		this.setJSONDefaults()
+		await this.setJSONDefaults()
 	}
 
 	addSchemas(addSchemas: IMonacoSchemaArrayEntry[]) {
@@ -188,46 +203,67 @@ export class JsonDefaults extends EventDispatcher<void> {
 	async getDynamicSchemas() {
 		return (
 			await Promise.all(
-				FileType.getIds().map((id) => this.requestSchemaFor(id))
+				App.fileType.getIds().map((id) => this.requestSchemaFor(id))
 			)
 		).flat()
 	}
-	async loadStaticSchemas(fileHandle: AnyFileHandle) {
-		if (loadedGlobalSchemas) return
+	async loadStaticSchemas(
+		fileHandle: AnyFileHandle,
+		updateSchemaEntries = false
+	) {
+		if (!loadedGlobalSchemas) {
+			const file = await fileHandle.getFile()
+			const schemas = JSON.parse(await file.text())
 
-		const file = await fileHandle.getFile()
-		const schemas = json5.parse(await file.text())
-
-		for (const uri in schemas) {
-			globalSchemas[uri] = { uri, schema: schemas[uri] }
+			for (const uri in schemas) {
+				globalSchemas[uri] = { uri, schema: schemas[uri] }
+			}
 		}
 
-		// ...add file type entries
-		FileType.getMonacoSchemaArray().forEach((addSchema) => {
-			// Non-json files; e.g. .lang
-			if (!addSchema.uri) return
+		if (updateSchemaEntries) {
+			// Fetch schema entry points
+			const schemaEntries = App.fileType.getMonacoSchemaEntries()
 
-			if (globalSchemas[addSchema.uri]) {
-				if (addSchema.schema)
-					globalSchemas[addSchema.uri].schema = addSchema.schema
+			// Reset old file matchers
+			schemaEntries.forEach((schemaEntry) => {
+				if (!schemaEntry.uri) return
 
-				if (addSchema.fileMatch) {
-					if (globalSchemas[addSchema.uri].fileMatch)
-						globalSchemas[addSchema.uri].fileMatch!.push(
-							...addSchema.fileMatch
-						)
-					else
-						globalSchemas[addSchema.uri].fileMatch =
-							addSchema.fileMatch
+				const currSchema = globalSchemas[schemaEntry.uri]
+
+				if (currSchema && currSchema.fileMatch && schemaEntry.fileMatch)
+					currSchema.fileMatch = undefined
+			})
+
+			// Add schema entry points
+			schemaEntries.forEach((schemaEntry) => {
+				// Non-json files; e.g. .lang
+				if (!schemaEntry.uri) return
+
+				if (globalSchemas[schemaEntry.uri]) {
+					if (schemaEntry.schema)
+						globalSchemas[schemaEntry.uri].schema =
+							schemaEntry.schema
+
+					if (schemaEntry.fileMatch) {
+						if (globalSchemas[schemaEntry.uri].fileMatch)
+							globalSchemas[schemaEntry.uri].fileMatch!.push(
+								...schemaEntry.fileMatch
+							)
+						else
+							globalSchemas[schemaEntry.uri].fileMatch =
+								schemaEntry.fileMatch
+					}
+				} else {
+					globalSchemas[schemaEntry.uri] = schemaEntry
 				}
-			} else {
-				globalSchemas[addSchema.uri] = addSchema
-			}
-		})
+			})
+		}
 	}
 
+	addSchemaEntries() {}
+
 	async runSchemaScripts(app: App, filePath?: string) {
-		const schemaScript = new SchemaScript(app, filePath)
+		const schemaScript = new SchemaScript(this, app, filePath)
 		await schemaScript.runSchemaScripts(this.localSchemas)
 	}
 }

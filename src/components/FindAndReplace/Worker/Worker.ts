@@ -1,18 +1,34 @@
+// @ts-ignore Make "path" work on this worker
+globalThis.process = {
+	cwd: () => '',
+	env: {},
+	release: {
+		name: 'browser',
+	},
+}
+
 import '/@/components/FileSystem/Virtual/Comlink'
 import { expose } from 'comlink'
 import { FileSystem } from '../../FileSystem/FileSystem'
-import { ESearchType } from '../Controls/SearchTypeEnum'
 import { iterateDir } from '/@/utils/iterateDir'
-import { extname } from '/@/utils/path'
+import { extname, join, relative } from '/@/utils/path'
 
 import { createRegExp, processFileText } from '../Utils'
-import { AnyDirectoryHandle } from '../../FileSystem/Types'
+import { AnyDirectoryHandle, AnyFileHandle } from '../../FileSystem/Types'
+import { ProjectConfig } from '../../Projects/Project/Config'
 
 export interface IQueryOptions {
-	searchType: ESearchType
+	searchType: number
+	isReadOnly?: boolean
+}
+export interface IDirectory {
+	directory: AnyDirectoryHandle
+	path: string
 }
 export interface IQueryResult {
+	fileHandle: AnyFileHandle
 	filePath: string
+	displayFilePath: string
 	matches: IMatch[]
 }
 export interface IMatch {
@@ -28,6 +44,7 @@ const knownTextFiles = new Set([
 	'.lang',
 	'.mcfunction',
 	'.txt',
+	'.md',
 	'.molang',
 	'.json',
 	'.html',
@@ -38,8 +55,14 @@ const textPreviewLength = 100
 export class FindAndReplace {
 	protected fileSystem: FileSystem
 	protected matchedFiles = new Set<string>()
-	constructor(protected projectFolderHandle: AnyDirectoryHandle) {
+	protected config: ProjectConfig
+
+	constructor(
+		protected projectFolderHandle: AnyDirectoryHandle,
+		protected projectPath: string
+	) {
 		this.fileSystem = new FileSystem(projectFolderHandle)
+		this.config = new ProjectConfig(this.fileSystem, projectPath)
 	}
 
 	setMatchedFiles(matchedFiles: string[]) {
@@ -49,7 +72,11 @@ export class FindAndReplace {
 		return [...oldFiles]
 	}
 
-	async createQuery(searchFor: string, { searchType }: IQueryOptions) {
+	async createQuery(
+		directories: IDirectory[],
+		searchFor: string,
+		{ searchType }: IQueryOptions
+	) {
 		this.matchedFiles.clear()
 
 		if (searchFor === '') return []
@@ -58,12 +85,19 @@ export class FindAndReplace {
 		const regExp = createRegExp(searchFor, searchType)
 		if (!regExp) return []
 
-		await this.iterateProject(regExp, queryResults)
+		const promises = []
+		for (const directory of directories) {
+			promises.push(
+				this.iterateDirectory(directory, regExp, queryResults)
+			)
+		}
+		await Promise.all(promises)
 
 		return queryResults
 	}
 
 	async executeQuery(
+		directories: IDirectory[],
 		searchFor: string,
 		replaceWith: string,
 		{ searchType }: IQueryOptions
@@ -73,15 +107,20 @@ export class FindAndReplace {
 		const regExp = createRegExp(searchFor, searchType)
 		if (!regExp) return []
 
-		await this.replaceAll(regExp, replaceWith)
+		const promises = []
+		for (const directory of directories) {
+			promises.push(this.replaceAll(directory, regExp, replaceWith))
+		}
+		await Promise.all(promises)
 	}
 
-	protected async iterateProject(
+	protected async iterateDirectory(
+		{ directory, path }: IDirectory,
 		regExp: RegExp,
 		queryResults: IQueryResult[]
 	) {
 		await iterateDir(
-			this.projectFolderHandle,
+			directory,
 			async (fileHandle, filePath) => {
 				const ext = extname(filePath)
 				if (!knownTextFiles.has(ext)) return
@@ -120,16 +159,29 @@ export class FindAndReplace {
 
 				if (matches.length > 0) {
 					this.matchedFiles.add(filePath)
-					queryResults.push({ filePath, matches })
+					queryResults.push({
+						filePath,
+						displayFilePath: join(
+							`./${directory.name}`,
+							relative(path, filePath)
+						),
+						fileHandle,
+						matches,
+					})
 				}
 			},
-			ignoreFolders
+			ignoreFolders,
+			path
 		)
 	}
 
-	protected async replaceAll(regExp: RegExp, replaceWith: string) {
+	protected async replaceAll(
+		{ directory, path }: IDirectory,
+		regExp: RegExp,
+		replaceWith: string
+	) {
 		await iterateDir(
-			this.projectFolderHandle,
+			directory,
 			async (fileHandle, filePath) => {
 				const ext = extname(filePath)
 				if (
@@ -151,10 +203,10 @@ export class FindAndReplace {
 				if (fileText !== newFileText)
 					await this.fileSystem.write(fileHandle, newFileText)
 			},
-			ignoreFolders
+			ignoreFolders,
+			path
 		)
 	}
-	protected async replaceInFile(regExp: RegExp, replaceWith: string) {}
 }
 
 expose(FindAndReplace)

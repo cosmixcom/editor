@@ -1,27 +1,34 @@
+// @ts-ignore Make "path" work on this worker
+globalThis.process = {
+	cwd: () => '',
+	env: {},
+	release: {
+		name: 'browser',
+	},
+}
+
 import '/@/components/FileSystem/Virtual/Comlink'
-import { FileType, IFileType } from '/@/components/Data/FileType'
+import { FileTypeLibrary, IFileType } from '/@/components/Data/FileType'
 import { expose } from 'comlink'
 import { TaskService } from '/@/components/TaskManager/WorkerTask'
 import { LightningStore } from './LightningCache/LightningStore'
-import {
-	fileStore,
-	getCategoryDirectory,
-	getFileStoreDirectory,
-	PackSpider,
-} from './PackSpider/PackSpider'
+import { PackSpider } from './PackSpider/PackSpider'
 import { LightningCache } from './LightningCache/LightningCache'
 import { FileSystem } from '/@/components/FileSystem/FileSystem'
-import { PackType } from '/@/components/Data/PackType'
+import { PackTypeLibrary } from '/@/components/Data/PackType'
 import { DataLoader } from '/@/components/Data/DataLoader'
 import { AnyDirectoryHandle } from '/@/components/FileSystem/Types'
+import { ProjectConfig } from '/@/components/Projects/Project/Config'
 export type { ILightningInstruction } from './LightningCache/LightningCache'
 
 export interface IPackIndexerOptions {
 	pluginFileTypes: IFileType[]
 	disablePackSpider: boolean
 	noFullLightningCacheRefresh: boolean
+	projectPath: string
 }
 
+const dataLoader: DataLoader = new DataLoader()
 export class PackIndexerService extends TaskService<
 	readonly [string[], string[]],
 	boolean
@@ -30,24 +37,43 @@ export class PackIndexerService extends TaskService<
 	protected packSpider: PackSpider
 	protected lightningCache: LightningCache
 	public fileSystem: FileSystem
+	public projectFileSystem: FileSystem
+	public globalFileSystem: FileSystem
+	public config: ProjectConfig
+	public fileType: FileTypeLibrary
+	public packType: PackTypeLibrary
 
 	constructor(
-		projectDirectory: AnyDirectoryHandle,
-		protected baseDirectory: AnyDirectoryHandle,
+		protected projectDirectory: AnyDirectoryHandle,
+		baseDirectory: AnyDirectoryHandle,
 		protected readonly options: IPackIndexerOptions
 	) {
 		super()
-		this.fileSystem = new FileSystem(projectDirectory)
-		this.lightningStore = new LightningStore(this.fileSystem)
+
+		this.fileSystem = new FileSystem(baseDirectory)
+		this.projectFileSystem = new FileSystem(projectDirectory)
+		this.config = new ProjectConfig(
+			this.projectFileSystem,
+			options.projectPath
+		)
+		this.fileType = new FileTypeLibrary(this.config)
+		this.packType = new PackTypeLibrary(this.config)
+
+		this.globalFileSystem = new FileSystem(baseDirectory)
+		this.lightningStore = new LightningStore(
+			this.projectFileSystem,
+			this.fileType,
+			options.projectPath
+		)
 		this.packSpider = new PackSpider(this, this.lightningStore)
 		this.lightningCache = new LightningCache(this, this.lightningStore)
-		FileType.setPluginFileTypes(options.pluginFileTypes)
+		this.fileType.setPluginFileTypes(options.pluginFileTypes)
 	}
 
 	getOptions() {
 		return {
-			projectDirectory: this.fileSystem.baseDirectory,
-			baseDirectory: this.baseDirectory,
+			projectDirectory: this.projectDirectory,
+			baseDirectory: this.fileSystem.baseDirectory,
 			...this.options,
 		}
 	}
@@ -55,22 +81,19 @@ export class PackIndexerService extends TaskService<
 	async onStart(forceRefresh: boolean) {
 		console.time('[WORKER] SETUP')
 		this.lightningStore.reset()
+		if (!dataLoader.hasFired) await dataLoader.loadData()
 
-		let dataLoader: DataLoader | undefined = new DataLoader()
 		await Promise.all([
-			FileType.setup(dataLoader),
-			PackType.setup(dataLoader),
+			this.fileType.setup(dataLoader),
+			this.packType.setup(dataLoader),
+			this.config.setup(false),
 		])
-		dataLoader = undefined
 
 		console.timeEnd('[WORKER] SETUP')
 
 		console.time('[WORKER] LightningCache')
-		const [
-			filePaths,
-			changedFiles,
-			deletedFiles,
-		] = await this.lightningCache.start(forceRefresh)
+		const [filePaths, changedFiles, deletedFiles] =
+			await this.lightningCache.start(forceRefresh)
 		console.timeEnd('[WORKER] LightningCache')
 
 		console.time('[WORKER] PackSpider')
@@ -83,7 +106,8 @@ export class PackIndexerService extends TaskService<
 	async updateFile(
 		filePath: string,
 		fileContent?: string,
-		isForeignFile = false
+		isForeignFile = false,
+		hotUpdate = false
 	) {
 		const fileDidChange = await this.lightningCache.processFile(
 			filePath,
@@ -92,42 +116,47 @@ export class PackIndexerService extends TaskService<
 		)
 
 		if (fileDidChange) {
-			await this.lightningStore.saveStore()
+			if (!hotUpdate) await this.lightningStore.saveStore(false)
 			await this.packSpider.updateFile(filePath)
 		}
+
+		return fileDidChange
+	}
+	async updateFiles(filePaths: string[], hotUpdate = false) {
+		let anyFileChanged = false
+		for (let i = 0; i < filePaths.length; i++) {
+			const fileDidChange = await this.updateFile(
+				filePaths[i],
+				undefined,
+				false,
+				false
+			)
+			if (fileDidChange) anyFileChanged = true
+		}
+
+		if (!hotUpdate && anyFileChanged)
+			await this.lightningStore.saveStore(false)
+
+		return anyFileChanged
 	}
 	hasFile(filePath: string) {
 		return this.lightningStore.has(filePath)
 	}
 
-	unlink(path: string) {
-		return this.lightningCache.unlink(path)
+	async rename(fromPath: string, toPath: string, saveStore = true) {
+		this.lightningStore.rename(fromPath, toPath)
+		if (saveStore) await this.lightningStore.saveStore(false)
+	}
+
+	unlinkFile(path: string, saveCache = true) {
+		return this.lightningCache.unlinkFile(path, saveCache)
+	}
+	saveCache() {
+		return this.lightningStore.saveStore(false)
 	}
 
 	updatePlugins(pluginFileTypes: IFileType[]) {
-		FileType.setPluginFileTypes(pluginFileTypes)
-	}
-
-	async readdir(path: string[]) {
-		if (this.options.disablePackSpider) {
-			if (path.length > 0)
-				return (
-					await this.fileSystem.readdir(path.join('/'), {
-						withFileTypes: true,
-					})
-				).map((dirent) => ({
-					kind: dirent.kind,
-					name: dirent.name,
-					path: path.concat([dirent.name]),
-				}))
-
-			return []
-		}
-
-		if (path.length === 0) return []
-		if (path.length === 1) return getFileStoreDirectory(path[0])
-		if (path.length === 2) return getCategoryDirectory(path[0], path[1])
-		return fileStore[path[0]][path[1]][path[2]].toDirectory()
+		this.fileType.setPluginFileTypes(pluginFileTypes)
 	}
 
 	find(
@@ -158,12 +187,18 @@ export class PackIndexerService extends TaskService<
 		)
 	}
 
-	getAllFiles(sorted = false) {
+	getAllFiles(fileType?: string, sorted = false) {
 		if (sorted)
 			return this.lightningStore
-				.allFiles()
+				.allFiles(fileType)
 				.sort((a, b) => a.localeCompare(b))
-		return this.lightningStore.allFiles()
+		return this.lightningStore.allFiles(fileType)
+	}
+	getFileDiagnostics(filePath: string) {
+		return this.packSpider.getDiagnostics(filePath)
+	}
+	getConnectedFiles(filePath: string) {
+		return this.packSpider.getConnectedFiles(filePath)
 	}
 
 	getSchemasFor(fileType: string, fromFilePath?: string) {
